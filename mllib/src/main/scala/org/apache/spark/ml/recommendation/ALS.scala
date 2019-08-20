@@ -778,8 +778,10 @@ object ALS extends DefaultParamsReadable[ALS] with Logging {
       .setName("itemFactors")
       .persist(finalRDDStorageLevel)
     if (finalRDDStorageLevel != StorageLevel.NONE) {
+      // job2
       userIdAndFactors.count()
       itemFactors.unpersist()
+      // job3
       itemIdAndFactors.count()
       userInBlocks.unpersist()
       userOutBlocks.unpersist()

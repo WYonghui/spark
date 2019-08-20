@@ -80,9 +80,9 @@ public final class JavaALS {
     MatrixFactorizationModel model = ALS.train(ratings.rdd(), rank, iterations, 0.01, blocks);
 
     model.userFeatures().toJavaRDD().map(new FeaturesToString()).saveAsTextFile(
-        outputDir + "/userFeatures");
+        outputDir + "/userFeatures"); //job10
     model.productFeatures().toJavaRDD().map(new FeaturesToString()).saveAsTextFile(
-        outputDir + "/productFeatures");
+        outputDir + "/productFeatures"); //job11
     System.out.println("Final user/product features written to " + outputDir);
 
     sc.stop();

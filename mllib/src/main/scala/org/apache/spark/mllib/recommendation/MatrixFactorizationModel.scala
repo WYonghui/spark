@@ -60,7 +60,9 @@ class MatrixFactorizationModel @Since("0.8.0") (
   extends Saveable with Serializable with Logging {
 
   require(rank > 0)
+  // job9
   validateFeatures("User", userFeatures)
+  // job8
   validateFeatures("Product", productFeatures)
 
   /** Validates factors and warns users if there are performance concerns. */
