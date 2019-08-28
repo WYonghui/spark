@@ -274,13 +274,12 @@ class ALS private (
       .setName("products")
       .persist(finalRDDStorageLevel)
     if (finalRDDStorageLevel != StorageLevel.NONE) {
-      // job4
+      // job4,可能这里是job4
       userFactors.count()
       // job5
       prodFactors.count()
     }
     logInfo("Message from mllib.ALS hahahahhahahahhahaha")
-    println("Message from mllib.ALS hahahahhahahahhahaha") //scalastyle:off
     new MatrixFactorizationModel(rank, userFactors, prodFactors)
   }
 

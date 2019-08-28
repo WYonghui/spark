@@ -690,7 +690,8 @@ object ALS extends DefaultParamsReadable[ALS] with Logging {
       .persist(intermediateRDDStorageLevel)
     val (userInBlocks, userOutBlocks) =
       makeBlocks("user", blockRatings, userPart, itemPart, intermediateRDDStorageLevel)
-    // materialize blockRatings and user blocks
+//     materialize blockRatings and user blocks
+    // 怀疑此次是job2，第一个count
     userOutBlocks.count()
     val swappedBlockRatings = blockRatings.map {
       case ((userBlockId, itemBlockId), RatingBlock(userIds, itemIds, localRatings)) =>
@@ -698,7 +699,8 @@ object ALS extends DefaultParamsReadable[ALS] with Logging {
     }
     val (itemInBlocks, itemOutBlocks) =
       makeBlocks("item", swappedBlockRatings, itemPart, userPart, intermediateRDDStorageLevel)
-    // materialize item blocks
+//     materialize item blocks
+//     怀疑此处是job3，第二个count
     itemOutBlocks.count()
     val seedGen = new XORShiftRandom(seed)
     var userFactors = initialize(userInBlocks, rank, seedGen.nextLong())
