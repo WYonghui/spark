@@ -274,9 +274,9 @@ class ALS private (
       .setName("products")
       .persist(finalRDDStorageLevel)
     if (finalRDDStorageLevel != StorageLevel.NONE) {
-      // job4,可能这里是job4
+      // job2,可能这里是job2
       userFactors.count()
-      // job5
+      // job3
       prodFactors.count()
     }
     logInfo("Message from mllib.ALS hahahahhahahahhahaha")

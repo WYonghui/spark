@@ -485,6 +485,8 @@ class ALS(@Since("1.4.0") override val uid: String) extends Estimator[ALSModel] 
 }
 
 
+
+
 /**
  * :: DeveloperApi ::
  * An implementation of ALS that supports generic ID types, specialized for Int and Long. This is
@@ -687,20 +689,52 @@ object ALS extends DefaultParamsReadable[ALS] with Logging {
     val itemLocalIndexEncoder = new LocalIndexEncoder(itemPart.numPartitions)
     val solver = if (nonnegative) new NNLSSolver else new CholeskySolver
     val blockRatings = partitionRatings(ratings, userPart, itemPart)
-      .persist(intermediateRDDStorageLevel)
+      .persist(intermediateRDDStorageLevel) // job0-stage1
+
+    // job0-stage2
     val (userInBlocks, userOutBlocks) =
       makeBlocks("user", blockRatings, userPart, itemPart, intermediateRDDStorageLevel)
+
+//     save the data of job0-stage2
+//    userOutBlocks.map {
+//      case (abc, xyz) =>
+//        val str = new mutable.StringBuilder()
+//        str.++=(abc.toString)
+//          .+=(',')
+//          .++=(xyz.length.toString)
+//
+//        for (item <- xyz) {
+//          str.+=(',')
+//              .++=(item.length.toString)
+//          for (i <- 0 to (item.length - 1)) {
+//            str.+=(',')
+//              .++=(item(i).toString)
+//          }
+//
+//        }
+//        str.toString()
+//    }.saveAsTextFile("hdfs://node91:9000/wyh/output/ALS/job2Stage8.data")
+//    userOutBlocks.saveAsObjectFile("hdfs://node91:9000/wyh/output/ALS/job2Stage8.data")
+//    val path1: String = "hdfs://node91:9000/wyh/output/ALS/job2Stage8.data"
+//    val userOutBlocks: RDD[(Int, ALS.OutBlock)] = sc.objectFile(path1)
 //     materialize blockRatings and user blocks
-    // 怀疑此次是job2，第一个count
+    // 此次是job0，第一个count,job0-stage2
     userOutBlocks.count()
     val swappedBlockRatings = blockRatings.map {
       case ((userBlockId, itemBlockId), RatingBlock(userIds, itemIds, localRatings)) =>
         ((itemBlockId, userBlockId), RatingBlock(itemIds, userIds, localRatings))
-    }
+    } // job1-stage4
+
+//    save the data of job1-stage4, it is the input of job2-stage9
+//    swappedBlockRatings.saveAsObjectFile("hdfs://node91:9000/wyh/output/ALS/job2Stage9.data")
+//    val path: String = "hdfs://node91:9000/wyh/output/ALS/job2Stage9.data"
+//    val swappedBlockRatings: RDD[((Int, Int), ALS.RatingBlock[ID])] = sc.objectFile(path)
+
+    // job1-stage5
     val (itemInBlocks, itemOutBlocks) =
       makeBlocks("item", swappedBlockRatings, itemPart, userPart, intermediateRDDStorageLevel)
 //     materialize item blocks
-//     怀疑此处是job3，第二个count
+//     此处是job1，第二个count,job1-stage5
     itemOutBlocks.count()
     val seedGen = new XORShiftRandom(seed)
     var userFactors = initialize(userInBlocks, rank, seedGen.nextLong())
@@ -757,6 +791,7 @@ object ALS extends DefaultParamsReadable[ALS] with Logging {
           itemLocalIndexEncoder, solver = solver)
       }
     }
+    // job2-stage9
     val userIdAndFactors = userInBlocks
       .mapValues(_.srcIds)
       .join(userFactors)
@@ -768,7 +803,7 @@ object ALS extends DefaultParamsReadable[ALS] with Logging {
       // and userFactors.
       }, preservesPartitioning = true)
       .setName("userFactors")
-      .persist(finalRDDStorageLevel)
+//      .persist(finalRDDStorageLevel)
     val itemIdAndFactors = itemInBlocks
       .mapValues(_.srcIds)
       .join(itemFactors)
@@ -780,10 +815,8 @@ object ALS extends DefaultParamsReadable[ALS] with Logging {
       .setName("itemFactors")
       .persist(finalRDDStorageLevel)
     if (finalRDDStorageLevel != StorageLevel.NONE) {
-      // job2
       userIdAndFactors.count()
       itemFactors.unpersist()
-      // job3
       itemIdAndFactors.count()
       userInBlocks.unpersist()
       userOutBlocks.unpersist()
@@ -1220,7 +1253,11 @@ object ALS extends DefaultParamsReadable[ALS] with Logging {
         }
         builder.build().compress()
       }.setName(prefix + "InBlocks")
-      .persist(storageLevel)
+      .persist(storageLevel) // job2-stage10
+
+    // save data for job2-stage10
+//    inBlocks.saveAsObjectFile("hdfs://node91:9000/wyh/output/ALS/job2Stage10.data")
+
     val outBlocks = inBlocks.mapValues { case InBlock(srcIds, dstPtrs, dstEncodedIndices, _) =>
       val encoder = new LocalIndexEncoder(dstPart.numPartitions)
       val activeIds = Array.fill(dstPart.numPartitions)(mutable.ArrayBuilder.make[Int])
