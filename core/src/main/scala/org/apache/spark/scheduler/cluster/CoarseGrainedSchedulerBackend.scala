@@ -357,6 +357,7 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, val rpcEnv: Rp
   }
 
   protected def createDriverEndpoint(properties: Seq[(String, String)]): DriverEndpoint = {
+//    向RpcEnv注册DriverEndpoint,DriverEndpoint用于提交task到Executor，接收Executor返回的计算结果
     new DriverEndpoint(rpcEnv, properties)
   }
 

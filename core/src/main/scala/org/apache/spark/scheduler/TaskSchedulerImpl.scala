@@ -135,8 +135,10 @@ private[spark] class TaskSchedulerImpl(
 
   def initialize(backend: SchedulerBackend) {
     this.backend = backend
-    // temporarily set rootPool name to empty
+//     temporarily set rootPool name to empty
+//     rootPool中缓存了调度队列、调度算法及TaskSetManager集合等信息
     rootPool = new Pool("", schedulingMode, 0, 0)
+//  schedulableBuilder维护pool和taskSetManager
     schedulableBuilder = {
       schedulingMode match {
         case SchedulingMode.FIFO =>
@@ -173,6 +175,8 @@ private[spark] class TaskSchedulerImpl(
     val tasks = taskSet.tasks
     logInfo("Adding task set " + taskSet.id + " with " + tasks.length + " tasks")
     this.synchronized {
+//    TaskSetManager用于管理TaskSet，包括任务推断，Task本地性，并对Task的资源进行分配
+//    TaskSetManager.priority决定stage的调度优先级
       val manager = createTaskSetManager(taskSet, maxTaskFailures)
       val stage = taskSet.stageId
       val stageTaskSets =
