@@ -189,8 +189,10 @@ private[spark] class TaskSchedulerImpl(
         throw new IllegalStateException(s"more than one active taskSet for stage $stage:" +
           s" ${stageTaskSets.toSeq.map{_._2.taskSet.id}.mkString(",")}")
       }
+//      向调度池中添加刚创建的TaskSetManager
       schedulableBuilder.addTaskSetManager(manager, manager.taskSet.properties)
 
+//      判断应用程序是否为非本地模式且没有接收到任务，是则定期检查TaskSchedulerImpl的饥饿状态
       if (!isLocal && !hasReceivedTask) {
         starvationTimer.scheduleAtFixedRate(new TimerTask() {
           override def run() {
@@ -206,6 +208,7 @@ private[spark] class TaskSchedulerImpl(
       }
       hasReceivedTask = true
     }
+//    接收到task，使用backend.reviveOffers()为task分配资源
     backend.reviveOffers()
   }
 
@@ -292,6 +295,7 @@ private[spark] class TaskSchedulerImpl(
    * sets for tasks in order of priority. We fill each node with tasks in a round-robin manner so
    * that tasks are balanced across the cluster.
    */
+//  该方法负责进行资源分配
   def resourceOffers(offers: IndexedSeq[WorkerOffer]): Seq[Seq[TaskDescription]] = synchronized {
     // Mark each slave as alive and remember its hostname
     // Also track if new executor is added
@@ -321,6 +325,7 @@ private[spark] class TaskSchedulerImpl(
     for (taskSet <- sortedTaskSets) {
       logDebug("parentName: %s, name: %s, runningTasks: %s".format(
         taskSet.parent.name, taskSet.name, taskSet.runningTasks))
+//      有新的executor加入时，重新计算本地性
       if (newExecAvail) {
         taskSet.executorAdded()
       }

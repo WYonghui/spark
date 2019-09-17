@@ -23,11 +23,12 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 import scala.annotation.tailrec
-import scala.collection.Map
+import scala.collection.{mutable, Map}
 import scala.collection.mutable.{HashMap, HashSet, Stack}
 import scala.concurrent.duration._
 import scala.language.existentials
 import scala.language.postfixOps
+import scala.util.control.Breaks._
 import scala.util.control.NonFatal
 
 import org.apache.commons.lang3.SerializationUtils
@@ -160,6 +161,8 @@ class DAGScheduler(
   private[scheduler] val failedStages = new HashSet[Stage]
 
   private[scheduler] val activeJobs = new HashSet[ActiveJob]
+
+  private[scheduler] val stagesPriority = new mutable.HashMap[Stage, Int]
 
   /**
    * Contains the locations that each RDD's partitions are cached on.  This map's keys are RDD ids
@@ -348,8 +351,9 @@ class DAGScheduler(
     stage
   }
 
-  /**
+/**
    * Create a ResultStage associated with the provided jobId.
+   * 创建ResultStage，并分析RDD依赖得到所有stage，加入到stageIdToStage队列
    */
   private def createResultStage(
       rdd: RDD[_],
@@ -446,6 +450,7 @@ class DAGScheduler(
           for (dep <- rdd.dependencies) {
             dep match {
               case shufDep: ShuffleDependency[_, _, _] =>
+                // 此处判断父stage是否已经完成，判断方法是父stage的所有partition是否都有了输出
                 val mapStage = getOrCreateShuffleMapStage(shufDep, stage.firstJobId)
                 if (!mapStage.isAvailable) {
                   missing += mapStage
@@ -763,8 +768,10 @@ class DAGScheduler(
     logTrace("failed: " + failedStages)
     val childStages = waitingStages.filter(_.parents.contains(parent)).toArray
     waitingStages --= childStages
-    for (stage <- childStages.sortBy(_.firstJobId)) {
-      submitStage(stage)
+    for (stage <- stagesPriority.toList.sortBy(-_._2)) {
+      if (childStages.contains(stage._1)) {
+        submitStageWithPriority(stage._1)
+      }
     }
   }
 
@@ -837,7 +844,8 @@ class DAGScheduler(
     try {
       // New stage creation may throw an exception if, for example, jobs are run on a
       // HadoopRDD whose underlying HDFS files have been deleted.
-      // 1. 使用触发job的最后一个RDD，创建finalStage
+      // 1. 使用触发job的最后一个RDD，创建finalStage,并分析DAG图划分Stage
+      // createResultStage根据依赖划分出所有的stage并创建了shuffleMapStage
       finalStage = createResultStage(finalRDD, func, partitions, jobId, callSite)
     } catch {
       case e: Exception =>
@@ -862,11 +870,16 @@ class DAGScheduler(
     finalStage.setActiveJob(job)
     val stageIds = jobIdToStageIds(jobId).toArray
     val stageInfos = stageIds.flatMap(id => stageIdToStage.get(id).map(_.latestInfo))
+    logInfo("Stages in job" + jobId)
+    for (stage <- stageInfos) {
+      logInfo(" " + stage.name)
+    }
     listenerBus.post(
       SparkListenerJobStart(job.jobId, jobSubmissionTime, stageInfos, properties))
 
 //  4. 使用submitStage方法提交finalStage
-    submitStage(finalStage)
+//    submitStage(finalStage)
+    divideStage(finalStage)
   }
 
   private[scheduler] def handleMapStageSubmitted(jobId: Int,
@@ -934,6 +947,97 @@ class DAGScheduler(
       }
     } else {
       abortStage(stage, "No active job for stage " + stage.id, None)
+    }
+  }
+
+//  划分stage，并为stage设定优先级
+  private def divideStage(stage: Stage) {
+    val priority = 1
+    setStagePriority(stage, stagesPriority, priority)
+
+//    val stages = stagesPriority.toList.sortBy(-_._2)
+//    for (stage <- stages) {
+//      logInfo("The priority of " + stage._1 + " is " + stage._2)
+//    }
+
+//    job提交后的第一轮调度从优先级最高的开始,遍历并提交可提交的stage
+    val stageList = stagesPriority.toList.sortBy(-_._2)
+    for (stageInfo <- stageList) {
+      val jobId = activeJobForStage(stageInfo._1)
+      logDebug("submitStage(" + stageInfo._1 + ")")
+      val missing = getMissingParentStages(stageInfo._1)
+      if (missing.isEmpty) {
+//      提交高优先级任务，并将其所有后代stage加入到waitingStages
+        logInfo("Submitting " + stageInfo._1 + " (" + stageInfo._1.rdd + ")," +
+          " which has no missing parents")
+        submitMissingTasksWithPriority(stageInfo._1, jobId.get, stageInfo._2)
+//      添加后代stage到waitingStages
+        addChildStageToWaitingStages(stageInfo._1)
+      }
+    }
+  }
+
+//  递归地将所有后代stage加入到waitingStages队列中
+  private def addChildStageToWaitingStages(parent: Stage): Unit = {
+    var childStages = new mutable.HashSet[Stage]()
+    for (stageInfo <- stagesPriority.toList) {
+      if (stageInfo._1.parents.contains(parent)) {
+        childStages += stageInfo._1
+      }
+    }
+
+    for (childStage <- childStages) {
+      waitingStages += childStage
+      addChildStageToWaitingStages(childStage)
+    }
+  }
+
+  private def submitStageWithPriority(stage: Stage): Unit = {
+    val jobId = activeJobForStage(stage)
+    if (jobId.isDefined) {
+      logDebug("submitStage(" + stage + ")")
+      if (!waitingStages(stage) && !runningStages(stage) && !failedStages(stage)) {
+        val missing = getMissingParentStages(stage).sortBy(_.id)
+        logDebug("missing: " + missing)
+        if (missing.isEmpty) {
+          logInfo("Submitting " + stage + " (" + stage.rdd + "), which has no missing parents")
+//        提交可执行stage，无父stage
+          submitMissingTasksWithPriority(stage, jobId.get, stagesPriority.get(stage).get)
+        } else {
+//          for (parent <- missing) {
+//            submitStageWithPriority(parent)
+//          }
+          waitingStages += stage
+        }
+      }
+    } else {
+      abortStage(stage, "No active job for stage " + stage.id, None)
+    }
+  }
+
+
+  private def setStagePriority(stage: Stage, stagesPriority: mutable.HashMap[Stage, Int],
+                               priority: Int) {
+    val jobId = activeJobForStage(stage)
+    var curPriority = priority
+
+    if (jobId.isDefined) {
+      if (!waitingStages(stage) && !runningStages(stage) && !failedStages(stage)) {
+        stagesPriority.put(stage, curPriority)
+        logDebug("the priority of " + stage.name + "is " + curPriority)
+        val missing = getMissingParentStages(stage).sortBy(_.id)
+        logDebug("missing: " + missing)
+        if (missing.nonEmpty) {
+          for (parent <- missing) {
+            if (stagesPriority.contains(parent)) {
+              curPriority = stagesPriority.apply(parent)
+            }
+            setStagePriority(parent, stagesPriority, curPriority + 1)
+          }
+        }
+      }
+    } else {
+      abortStage(stage, "setStagePriority:: No active job for stage " + stage.id, None)
     }
   }
 
@@ -1055,6 +1159,143 @@ class DAGScheduler(
       taskScheduler.submitTasks(new TaskSet(
 //        jobID是taskSet的priority
         tasks.toArray, stage.id, stage.latestInfo.attemptId, jobId, properties))
+      stage.latestInfo.submissionTime = Some(clock.getTimeMillis())
+    } else {
+      // Because we posted SparkListenerStageSubmitted earlier, we should mark
+      // the stage as completed here in case there are no tasks to run
+      markStageAsFinished(stage, None)
+
+      val debugString = stage match {
+        case stage: ShuffleMapStage =>
+          s"Stage ${stage} is actually done; " +
+            s"(available: ${stage.isAvailable}," +
+            s"available outputs: ${stage.numAvailableOutputs}," +
+            s"partitions: ${stage.numPartitions})"
+        case stage : ResultStage =>
+          s"Stage ${stage} is actually done; (partitions: ${stage.numPartitions})"
+      }
+      logDebug(debugString)
+
+      submitWaitingChildStages(stage)
+    }
+  }
+
+  private def submitMissingTasksWithPriority(stage: Stage, jobId: Int, priority: Int) {
+    logDebug("submitMissingTasks(" + stage + ")")
+    // Get our pending tasks and remember them in our pendingTasks entry
+    stage.pendingPartitions.clear()
+
+    // First figure out the indexes of partition ids to compute.
+    val partitionsToCompute: Seq[Int] = stage.findMissingPartitions()
+
+    // Use the scheduling pool, job group, description, etc. from an ActiveJob associated
+    // with this Stage
+    val properties = jobIdToActiveJob(jobId).properties
+
+    runningStages += stage
+    // SparkListenerStageSubmitted should be posted before testing whether tasks are
+    // serializable. If tasks are not serializable, a SparkListenerStageCompleted event
+    // will be posted, which should always come after a corresponding SparkListenerStageSubmitted
+    // event.
+    stage match {
+      case s: ShuffleMapStage =>
+        outputCommitCoordinator.stageStart(stage = s.id, maxPartitionId = s.numPartitions - 1)
+      case s: ResultStage =>
+        outputCommitCoordinator.stageStart(
+          stage = s.id, maxPartitionId = s.rdd.partitions.length - 1)
+    }
+//  获取task对应partition的最佳位置
+    val taskIdToLocations: Map[Int, Seq[TaskLocation]] = try {
+      stage match {
+        case s: ShuffleMapStage =>
+          partitionsToCompute.map { id => (id, getPreferredLocs(stage.rdd, id))}.toMap
+        case s: ResultStage =>
+          partitionsToCompute.map { id =>
+            val p = s.partitions(id)
+            (id, getPreferredLocs(stage.rdd, p))
+          }.toMap
+      }
+    } catch {
+      case NonFatal(e) =>
+        stage.makeNewStageAttempt(partitionsToCompute.size)
+        listenerBus.post(SparkListenerStageSubmitted(stage.latestInfo, properties))
+        abortStage(stage, s"Task creation failed: $e\n${Utils.exceptionString(e)}", Some(e))
+        runningStages -= stage
+        return
+    }
+
+    stage.makeNewStageAttempt(partitionsToCompute.size, taskIdToLocations.values.toSeq)
+    listenerBus.post(SparkListenerStageSubmitted(stage.latestInfo, properties))
+
+//  获取taskBinary,将stage的RDD和shuffleDependency广播到executor
+    // TODO: Maybe we can keep the taskBinary in Stage to avoid serializing it multiple times.
+    // Broadcasted binary for the task, used to dispatch tasks to executors. Note that we broadcast
+    // the serialized copy of the RDD and for each task we will deserialize it, which means each
+    // task gets a different copy of the RDD. This provides stronger isolation between tasks that
+    // might modify state of objects referenced in their closures. This is necessary in Hadoop
+    // where the JobConf/Configuration object is not thread-safe.
+    var taskBinary: Broadcast[Array[Byte]] = null
+    try {
+      // For ShuffleMapTask, serialize and broadcast (rdd, shuffleDep).
+      // For ResultTask, serialize and broadcast (rdd, func).
+      val taskBinaryBytes: Array[Byte] = stage match {
+        case stage: ShuffleMapStage =>
+          JavaUtils.bufferToArray(
+            closureSerializer.serialize((stage.rdd, stage.shuffleDep): AnyRef))
+        case stage: ResultStage =>
+          JavaUtils.bufferToArray(closureSerializer.serialize((stage.rdd, stage.func): AnyRef))
+      }
+
+      taskBinary = sc.broadcast(taskBinaryBytes)
+    } catch {
+      // In the case of a failure during serialization, abort the stage.
+      case e: NotSerializableException =>
+        abortStage(stage, "Task not serializable: " + e.toString, Some(e))
+        runningStages -= stage
+
+        // Abort execution
+        return
+      case NonFatal(e) =>
+        abortStage(stage, s"Task serialization failed: $e\n${Utils.exceptionString(e)}", Some(e))
+        runningStages -= stage
+        return
+    }
+//  为stage创建task
+    val tasks: Seq[Task[_]] = try {
+      stage match {
+        case stage: ShuffleMapStage =>
+          partitionsToCompute.map { id =>
+            val locs = taskIdToLocations(id)
+            val part = stage.rdd.partitions(id)
+            new ShuffleMapTask(stage.id, stage.latestInfo.attemptId,
+              taskBinary, part, locs, stage.latestInfo.taskMetrics, properties, Option(jobId),
+              Option(sc.applicationId), sc.applicationAttemptId)
+          }
+
+        case stage: ResultStage =>
+          partitionsToCompute.map { id =>
+            val p: Int = stage.partitions(id)
+            val part = stage.rdd.partitions(p)
+            val locs = taskIdToLocations(id)
+            new ResultTask(stage.id, stage.latestInfo.attemptId,
+              taskBinary, part, locs, id, properties, stage.latestInfo.taskMetrics,
+              Option(jobId), Option(sc.applicationId), sc.applicationAttemptId)
+          }
+      }
+    } catch {
+      case NonFatal(e) =>
+        abortStage(stage, s"Task creation failed: $e\n${Utils.exceptionString(e)}", Some(e))
+        runningStages -= stage
+        return
+    }
+
+    if (tasks.size > 0) {
+      logInfo("Submitting " + tasks.size + " missing tasks from " + stage + " (" + stage.rdd + ")")
+      stage.pendingPartitions ++= tasks.map(_.partitionId)
+      logDebug("New pending partitions: " + stage.pendingPartitions)
+      taskScheduler.submitTasks(new TaskSet(
+        //        jobID是taskSet的priority
+        tasks.toArray, stage.id, stage.latestInfo.attemptId, priority, properties))
       stage.latestInfo.submissionTime = Some(clock.getTimeMillis())
     } else {
       // Because we posted SparkListenerStageSubmitted earlier, we should mark

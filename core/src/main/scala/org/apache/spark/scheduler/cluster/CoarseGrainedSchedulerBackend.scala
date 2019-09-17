@@ -215,10 +215,14 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, val rpcEnv: Rp
     // Make fake resource offers on all executors
     private def makeOffers() {
       // Filter out executors under killing
+//      1.筛选掉死去的executors
       val activeExecutors = executorDataMap.filterKeys(executorIsAlive)
+//      2.将这个application所有可用的executor，将其封装为workOffers，每个workOffers代表了每个executor可用的cpu资源数量
       val workOffers = activeExecutors.map { case (id, executorData) =>
         new WorkerOffer(id, executorData.executorHost, executorData.freeCores)
       }.toIndexedSeq
+//      3.调用scheduler的resourceOffers方法，将workOffers传入，实际调用的是TaskSchedulerImpl的resourceOffers方法
+//      4.获取scheduler.resourceOffers的返回值，调用launchTasks方法，启动task
       launchTasks(scheduler.resourceOffers(workOffers))
     }
 
