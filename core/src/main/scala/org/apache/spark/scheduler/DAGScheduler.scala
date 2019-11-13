@@ -330,6 +330,7 @@ class DAGScheduler(
     shuffleIdToMapStage(shuffleDep.shuffleId) = stage
     updateJobIdStageIdMaps(jobId, stage)
 
+//   已有计算结果的stage，获取已计算的数据，避免重复计算
     if (mapOutputTracker.containsShuffle(shuffleDep.shuffleId)) {
       // A previously run stage generated partitions for this shuffle, so for each output
       // that's still available, copy information about that output location to the new stage
@@ -917,7 +918,7 @@ class DAGScheduler(
     val stageInfos = stageIds.flatMap(id => stageIdToStage.get(id).map(_.latestInfo))
     listenerBus.post(
       SparkListenerJobStart(job.jobId, jobSubmissionTime, stageInfos, properties))
-    submitStage(finalStage)
+    submitStageWithPriority(finalStage)
 
     // If the whole stage has already finished, tell the listener and remove it
     if (finalStage.isAvailable) {
@@ -955,24 +956,36 @@ class DAGScheduler(
     val priority = 1
     setStagePriority(stage, stagesPriority, priority)
 
-//    val stages = stagesPriority.toList.sortBy(-_._2)
-//    for (stage <- stages) {
-//      logInfo("The priority of " + stage._1 + " is " + stage._2)
-//    }
-
 //    job提交后的第一轮调度从优先级最高的开始,遍历并提交可提交的stage
     val stageList = stagesPriority.toList.sortBy(-_._2)
     for (stageInfo <- stageList) {
       val jobId = activeJobForStage(stageInfo._1)
       logDebug("submitStage(" + stageInfo._1 + ")")
-      val missing = getMissingParentStages(stageInfo._1)
-      if (missing.isEmpty) {
-//      提交高优先级任务，并将其所有后代stage加入到waitingStages
-        logInfo("Submitting " + stageInfo._1 + " (" + stageInfo._1.rdd + ")," +
-          " which has no missing parents")
-        submitMissingTasksWithPriority(stageInfo._1, jobId.get, stageInfo._2)
-//      添加后代stage到waitingStages
-        addChildStageToWaitingStages(stageInfo._1)
+      if (!waitingStages(stageInfo._1) && !runningStages(stageInfo._1) &&
+        !failedStages(stageInfo._1)) {
+        val missing = getMissingParentStages(stageInfo._1)
+        if (missing.isEmpty) {
+          //        此处需要判断stage是否已完成。如果已完成则无需再次submit
+          val curStage = stageInfo._1
+          val curStagePriority = stageInfo._2
+          curStage match {
+            case s: ShuffleMapStage =>
+              if (!s.isAvailable) {
+                logInfo("divideStage:: Submitting " + curStage + " (" + curStage.rdd + ")," +
+                  " which has no missing parents")
+//                提交高优先级任务，并将其所有后代stage加入到waitingStages
+                submitMissingTasksWithPriority(curStage, jobId.get, curStagePriority)
+//                添加后代stage到waitingStages
+                addChildStageToWaitingStages(curStage)
+              }
+            case s: ResultStage =>
+              if (jobId.isDefined) {
+                logInfo("divideStage:: Submitting " + curStage + " (" + curStage.rdd + ")," +
+                  " which has no missing parents")
+                submitMissingTasksWithPriority(curStage, jobId.get, curStagePriority)
+              }
+          }
+        }
       }
     }
   }
@@ -996,11 +1009,13 @@ class DAGScheduler(
     val jobId = activeJobForStage(stage)
     if (jobId.isDefined) {
       logDebug("submitStage(" + stage + ")")
+
       if (!waitingStages(stage) && !runningStages(stage) && !failedStages(stage)) {
         val missing = getMissingParentStages(stage).sortBy(_.id)
         logDebug("missing: " + missing)
         if (missing.isEmpty) {
-          logInfo("Submitting " + stage + " (" + stage.rdd + "), which has no missing parents")
+          logInfo("submitStageWithPriority:: Submitting " + stage + " (" + stage.rdd +
+            "), which has no missing parents")
 //        提交可执行stage，无父stage
           submitMissingTasksWithPriority(stage, jobId.get, stagesPriority.get(stage).get)
         } else {
@@ -1432,6 +1447,7 @@ class DAGScheduler(
                 logInfo("Ignoring result from " + rt + " because its job has finished")
             }
 
+//          处理stage完成
           case smt: ShuffleMapTask =>
             val shuffleStage = stage.asInstanceOf[ShuffleMapStage]
             updateAccumulators(event)
@@ -1464,13 +1480,15 @@ class DAGScheduler(
 
               clearCacheLocs()
 
+//              如果完成的task所属stage没有全部完成，则重新提交该stage；
+              // 否则，在所有包含该stage的作业中标记该stage为已完成，并提交子stage
               if (!shuffleStage.isAvailable) {
                 // Some tasks had failed; let's resubmit this shuffleStage
                 // TODO: Lower-level scheduler should also deal with this
                 logInfo("Resubmitting " + shuffleStage + " (" + shuffleStage.name +
                   ") because some of its tasks had failed: " +
                   shuffleStage.findMissingPartitions().mkString(", "))
-                submitStage(shuffleStage)
+                submitStageWithPriority(shuffleStage)
               } else {
                 // Mark any map-stage jobs waiting on this stage as finished
                 if (shuffleStage.mapStageJobs.nonEmpty) {
