@@ -17,7 +17,8 @@
 
 package org.apache.spark.scheduler
 
-import java.io.NotSerializableException
+import java.io.{BufferedReader, InputStreamReader, NotSerializableException}
+import java.net.URI
 import java.util.Properties
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -31,6 +32,8 @@ import scala.language.postfixOps
 import scala.util.control.Breaks._
 import scala.util.control.NonFatal
 import org.apache.commons.lang3.SerializationUtils
+import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.fs.{FSDataInputStream, FileSystem, Path}
 import org.apache.spark._
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.executor.TaskMetrics
@@ -418,8 +421,8 @@ class DAGScheduler(
    * This function is scheduler-visible for the purpose of unit testing.
    */
   private[scheduler] def getShuffleDependencies(
-      rdd: RDD[_]): HashSet[ShuffleDependency[_, _, _]] = {
-    val parents = new HashSet[ShuffleDependency[_, _, _]]
+      rdd: RDD[_]): mutable.LinkedHashSet[ShuffleDependency[_, _, _]] = {
+    val parents = new mutable.LinkedHashSet[ShuffleDependency[_, _, _]]
     val visited = new HashSet[RDD[_]]
     val waitingForVisit = new Stack[RDD[_]]
     waitingForVisit.push(rdd)
@@ -885,8 +888,8 @@ class DAGScheduler(
 
 //   两个任务，一、给每个阶段赋予时间，用hashMap存储
     //   二、利用父阶段信息，计算并存储每个阶段的子阶段
-    val stageToChildren = new HashMap[Stage, HashSet[Stage]]()
-    calculateChildrenStages(finalStage, stageToChildren)
+//    val stageToChildren = new HashMap[Stage, HashSet[Stage]]()
+//    calculateChildrenStages(finalStage, stageToChildren)
 
 //  4. 使用submitStage方法提交finalStage
     // submitStage(finalStage)
@@ -980,16 +983,23 @@ class DAGScheduler(
         logDebug("fathers: " + missing)
         if (missing.nonEmpty) {
           for (parent <- missing) {
-            var brothers = stageToChildren.get(parent).get
-//            还没遍历到的阶段，为其创建子阶段集合
-            val brothersEmpty = brothers.isEmpty
-            if (brothersEmpty) {
-              brothers = new mutable.HashSet[Stage]()
+            val hasBrothers = stageToChildren.get(parent)
+            var emptyFlag = 0
+            val brothers = hasBrothers match {
+              case Some(theBrothers) =>
+//                // 获取父阶段的子阶段集合
+                theBrothers
+              case None =>
+//              // 还没遍历到的阶段，为其创建子阶段集合
+                emptyFlag = 1
+                new mutable.HashSet[Stage]()
             }
             brothers.add(stage)
-            stageToChildren(stage) = brothers
-//            如果子阶段集合已经存在，说明这个阶段已经被分析过，不需要重复分析
-            if (brothersEmpty) {
+            stageToChildren(parent) = brothers
+
+//            如果子阶段集合已经存在，说明这个阶段的父阶段已经被分析过，不需要重复分析
+            // 子阶段不存在，则递归分析父阶段
+            if (emptyFlag == 1) {
               calculateChildrenStages(parent, stageToChildren)
             }
           }
@@ -1000,6 +1010,43 @@ class DAGScheduler(
     }
   }
 
+  /**
+    * 读取阶段执行时间文件，如果文件存在且读取成功，返回true
+    * 文件不存在，则返回false
+    * @param stageDuration
+    * @return
+    */
+  private def readProfile(stageDuration: mutable.HashMap[Stage, Int]): Boolean = {
+    val hdfsUrl = "hdfs://node39:9000/hadoop-5nodes/dataset/"
+    val hdfsFile = "profile"
+    val realUrl = hdfsUrl + hdfsFile
+
+    val hdfs = FileSystem.get(URI.create(realUrl), new Configuration())
+    val path = new Path(realUrl)
+    if (hdfs.exists(path)) {
+      val inputStream : FSDataInputStream = hdfs.open(path)
+      val inputStreamReader = new InputStreamReader(inputStream)
+      val bufferedReader = new BufferedReader(inputStreamReader)
+
+      var str = bufferedReader.readLine()
+      while (str != null) {
+//        阶段运行时间配置格式为“stageId duration”
+        val profiles = str.split("\\W+")
+        stageDuration.put(stageIdToStage
+          .apply(Integer.parseInt(profiles(0))), Integer.parseInt(profiles(1)))
+
+        str = bufferedReader.readLine()
+      }
+
+      bufferedReader.close()
+      inputStreamReader.close()
+      inputStream.close()
+      true
+    } else {
+//      不存在配置文件时，返回false
+      false
+    }
+  }
 
 /**
     * 划分stage，并为stage设定优先级
@@ -1007,14 +1054,35 @@ class DAGScheduler(
     */
   private def divideStage(stage: Stage) {
     // 根据阶段的执行时间设定优先级
-    val stageDuration = new mutable.HashMap[Stage, Double]()
-    val stageToChildren = new mutable.HashMap[Stage, HashSet[Stage]]()
-    calculateChildrenStages(stage, stageToChildren)
-    setPriorityWithStageDuration(stage, stageDuration, stagesPriority, stageToChildren)
+    val stageDuration = new mutable.HashMap[Stage, Int]()
+    val hasProfile = readProfile(stageDuration)
 
-// // 实现按深度计算优先级
-    val priority = 1
-    setStagePriority(stage, stagesPriority, priority)
+//    存在配置信息，按执行时间计算influence
+    if (hasProfile) {
+      val stageToChildren = new mutable.HashMap[Stage, HashSet[Stage]]()
+      calculateChildrenStages(stage, stageToChildren)
+      setPriorityWithStageDuration(stage, stageDuration, stagesPriority, stageToChildren)
+
+//      debug
+      logInfo("Job id is " + stage.firstJobId)
+      logInfo("Stage id set: ")
+      for (stageId <- stageIdToStage.keySet) {
+        logInfo(stageId + ", ")
+      }
+      val stage0 = stageIdToStage.apply(0)
+      val stage1 = stageIdToStage.apply(1)
+      val priority0 = stagesPriority.apply(stage0)
+      val priority1 = stagesPriority.apply(stage1)
+      logInfo("the priority of stage0 and stage1 are " + priority0 +
+        " and " + priority1 + ", respectively.")
+
+    } else {
+
+//      实现按深度计算优先级
+      val priority = 1
+      setStagePriority(stage, stagesPriority, priority)
+    }
+
 
 //  // job提交后的第一轮调度从优先级最高的开始,遍历并提交可提交的stage
     val stageList = stagesPriority.toList.sortBy(-_._2)
@@ -1033,6 +1101,7 @@ class DAGScheduler(
               if (!s.isAvailable) {
                 logInfo("divideStage:: Submitting " + curStage + " (" + curStage.rdd + ")," +
                   " which has no missing parents")
+                logInfo("divideStage:: The priority is " + stagesPriority.apply(curStage))
 //                提交高优先级任务，并将其所有后代stage加入到waitingStages
                 submitMissingTasksWithPriority(curStage, jobId.get, curStagePriority)
 //                添加后代stage到waitingStages
@@ -1093,7 +1162,7 @@ class DAGScheduler(
     }
   }
 
-  /**
+/**
     * 分析阶段的深度和子阶段数，为阶段设定优先级
     * @param stage
     * @param stagesPriority
@@ -1126,7 +1195,7 @@ class DAGScheduler(
   }
 
   private def accumulateDuration(stage: Stage,
-                    stageDuration: mutable.HashMap[Stage, Double],
+                    stageDuration: mutable.HashMap[Stage, Int],
                     stageToChildren: mutable.HashMap[Stage, HashSet[Stage]]): Int = {
     var priority = 0
     val waitingForVisit = new mutable.Stack[Stage]()
@@ -1139,9 +1208,11 @@ class DAGScheduler(
         priority += stageDuration.apply(curStage)
         visited.add(curStage)
 
-        val children = stageToChildren.apply(curStage)
-        for (child <- children) {
-          waitingForVisit.push(child)
+        if (stageToChildren.contains(curStage)) {
+          val children = stageToChildren.apply(curStage)
+          for (child <- children) {
+            waitingForVisit.push(child)
+          }
         }
       }
     }
@@ -1150,7 +1221,7 @@ class DAGScheduler(
   }
 
   private def setPriorityWithStageDuration(stage: Stage,
-                         stageDuration: mutable.HashMap[Stage, Double],
+                         stageDuration: mutable.HashMap[Stage, Int],
                          stagesPriority: mutable.HashMap[Stage, Int],
                          stageToChildren: mutable.HashMap[Stage, HashSet[Stage]]): Unit = {
 //  // 计算stagePriority
@@ -1159,7 +1230,7 @@ class DAGScheduler(
       if (!waitingStages(stage) && !runningStages(stage) && !failedStages(stage)) {
         if (!stagesPriority.contains(stage)) { // 已经计算的阶段不再重复计算
 //      // 将所有子阶段执行时间累加
-          var priority = accumulateDuration(stage, stageDuration, stageToChildren)
+          val priority = accumulateDuration(stage, stageDuration, stageToChildren)
           stagesPriority.put(stage, priority)
           logDebug("the priority of " + stage.name + "is " + priority)
 
@@ -1205,7 +1276,7 @@ class DAGScheduler(
         outputCommitCoordinator.stageStart(
           stage = s.id, maxPartitionId = s.rdd.partitions.length - 1)
     }
-    //  获取task对应partition的最佳位置
+//  获取task对应partition的最佳位置
     val taskIdToLocations: Map[Int, Seq[TaskLocation]] = try {
       stage match {
         case s: ShuffleMapStage =>
