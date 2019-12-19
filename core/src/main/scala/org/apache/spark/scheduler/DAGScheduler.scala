@@ -24,18 +24,21 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 import scala.annotation.tailrec
-import scala.collection.{Map, mutable}
+import scala.collection.{mutable, Map}
 import scala.collection.mutable.{HashMap, HashSet, Stack}
 import scala.concurrent.duration._
 import scala.language.existentials
 import scala.language.postfixOps
 import scala.util.control.Breaks._
 import scala.util.control.NonFatal
+
 import org.apache.commons.lang3.SerializationUtils
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.{FSDataInputStream, FileSystem, Path}
+import org.apache.hadoop.fs.{FileSystem, FSDataInputStream, Path}
+
 import org.apache.spark._
 import org.apache.spark.broadcast.Broadcast
+
 import org.apache.spark.executor.TaskMetrics
 import org.apache.spark.internal.Logging
 import org.apache.spark.network.util.JavaUtils
@@ -536,6 +539,7 @@ class DAGScheduler(
                 }
               }
               // data structures based on StageId
+              stagesPriority -= stageIdToStage.apply(stageId)
               stageIdToStage -= stageId
               logDebug("After removal of stage %d, remaining stages = %d"
                 .format(stageId, stageIdToStage.size))
@@ -595,7 +599,7 @@ class DAGScheduler(
     assert(partitions.size > 0)
     val func2 = func.asInstanceOf[(TaskContext, Iterator[_]) => _]
     val waiter = new JobWaiter(this, jobId, partitions.size, resultHandler)
-    //    eventProcessLoop.post将JobSubmitted事件添加到DAGScheduler事件队列中
+//    eventProcessLoop.post将JobSubmitted事件添加到DAGScheduler事件队列中
     eventProcessLoop.post(JobSubmitted(
       jobId, rdd, func2, partitions.toArray, callSite, waiter,
       SerializationUtils.clone(properties)))
@@ -623,7 +627,7 @@ class DAGScheduler(
                     resultHandler: (Int, U) => Unit,
                     properties: Properties): Unit = {
     val start = System.nanoTime
-    //    返回一个JobWaiter，用于等待DAGScheduler任务完成
+//    返回一个JobWaiter，用于等待DAGScheduler任务完成
     val waiter = submitJob(rdd, func, partitions, callSite, resultHandler, properties)
     // Note: Do not call Await.ready(future) because that calls `scala.concurrent.blocking`,
     // which causes concurrent SQL executions to fail if a fork-join pool is used. Note that
@@ -881,7 +885,7 @@ class DAGScheduler(
     val stageInfos = stageIds.flatMap(id => stageIdToStage.get(id).map(_.latestInfo))
     logInfo("Stages in job" + jobId)
     for (stage <- stageInfos) {
-      logInfo(" " + stage.name)
+      logInfo("" + stage.name)
     }
     listenerBus.post(
       SparkListenerJobStart(job.jobId, jobSubmissionTime, stageInfos, properties))
@@ -1056,33 +1060,31 @@ class DAGScheduler(
     // 根据阶段的执行时间设定优先级
     val stageDuration = new mutable.HashMap[Stage, Int]()
     val hasProfile = readProfile(stageDuration)
+    val stageToChildren = new mutable.HashMap[Stage, HashSet[Stage]]()
+
+    calculateChildrenStages(stage, stageToChildren)
 
 //    存在配置信息，按执行时间计算influence
     if (hasProfile) {
-      val stageToChildren = new mutable.HashMap[Stage, HashSet[Stage]]()
-      calculateChildrenStages(stage, stageToChildren)
+      logInfo("There is profile in hdfs")
       setPriorityWithStageDuration(stage, stageDuration, stagesPriority, stageToChildren)
-
-//      debug
-      logInfo("Job id is " + stage.firstJobId)
-      logInfo("Stage id set: ")
-      for (stageId <- stageIdToStage.keySet) {
-        logInfo(stageId + ", ")
-      }
-      val stage0 = stageIdToStage.apply(0)
-      val stage1 = stageIdToStage.apply(1)
-      val priority0 = stagesPriority.apply(stage0)
-      val priority1 = stagesPriority.apply(stage1)
-      logInfo("the priority of stage0 and stage1 are " + priority0 +
-        " and " + priority1 + ", respectively.")
-
+      logInfo("No.1: is here something wrong?")
     } else {
-
+      logInfo("There is not profile")
 //      实现按深度计算优先级
-      val priority = 1
-      setStagePriority(stage, stagesPriority, priority)
+      setStagePriority(stage, stageToChildren, stagesPriority)
+      logInfo("No.2: is here something wrong?")
     }
 
+//      debug
+    logInfo("Job id is " + stage.firstJobId)
+    logInfo("stagesPriority's size is " + stagesPriority.keySet.size
+        + ", stageIdToStage's size is " + stageIdToStage.keySet.size)
+    logInfo("stageIdTostage: " + stageIdToStage.toString())
+    logInfo("Stage id set: ")
+    for (stageId <- stageIdToStage.keySet) {
+      logInfo(stageId + ", " + stagesPriority.apply(stageIdToStage(stageId)))
+    }
 
 //  // job提交后的第一轮调度从优先级最高的开始,遍历并提交可提交的stage
     val stageList = stagesPriority.toList.sortBy(-_._2)
@@ -1168,29 +1170,46 @@ class DAGScheduler(
     * @param stagesPriority
     * @param priority
     */
-  private def setStagePriority(stage: Stage, stagesPriority: mutable.HashMap[Stage, Int],
-                               priority: Int) {
-    val jobId = activeJobForStage(stage)
-    var curPriority = priority
+  private def setStagePriority(resultStage: Stage
+                               , stageToChildren: mutable.HashMap[Stage, HashSet[Stage]]
+                               , stagesPriority: mutable.HashMap[Stage, Int]) {
+    val jobId = activeJobForStage(resultStage)
+    val waitingForVisit = new mutable.Queue[Stage]()
 
     if (jobId.isDefined) {
-      if (!waitingStages(stage) && !runningStages(stage) && !failedStages(stage)) {
-        stagesPriority.put(stage, curPriority)
-        logDebug("the priority of " + stage.name + "is " + curPriority)
-        val missing = getMissingParentStages(stage).sortBy(_.id)
-        logDebug("missing: " + missing)
-        if (missing.nonEmpty) {
-          for (parent <- missing) {
-            if (stagesPriority.contains(parent)) {
-              // 此处实现有多个子阶段，将子阶段数加入到优先级中
-              curPriority = stagesPriority.apply(parent)
+//        初始化，将resultStage放入到hash表中
+//        并加入到等待处理队列
+        stagesPriority.put(resultStage, 1)
+        waitingForVisit.enqueue(resultStage)
+        while (waitingForVisit.nonEmpty) {
+          val stage = waitingForVisit.dequeue()
+
+//          分析每个父节点的最大影响力的子节点
+          val parents = getMissingParentStages(stage)
+          for (parent <- parents) {
+            val brothers = stageToChildren.apply(parent)
+            var maxPriority = 0
+            breakable(
+              for (brother <- brothers) {
+                if (stagesPriority.contains(brother)) {
+                  val brotherPriority = stagesPriority.apply(brother)
+                  if (maxPriority < brotherPriority) {
+                    maxPriority = brotherPriority
+                  }
+                } else {
+                  maxPriority = 0
+                  break()
+                }
+              }
+            )
+            if (maxPriority != 0) {
+              stagesPriority.put(parent, maxPriority + brothers.size)
+              waitingForVisit.enqueue(parent)
             }
-            setStagePriority(parent, stagesPriority, curPriority + 1)
           }
         }
-      }
     } else {
-      abortStage(stage, "setStagePriority:: No active job for stage " + stage.id, None)
+      abortStage(resultStage, "setStagePriority:: No active job for stage " + resultStage.id, None)
     }
   }
 
@@ -1299,7 +1318,7 @@ class DAGScheduler(
     stage.makeNewStageAttempt(partitionsToCompute.size, taskIdToLocations.values.toSeq)
     listenerBus.post(SparkListenerStageSubmitted(stage.latestInfo, properties))
 
-    //  获取taskBinary,将stage的RDD和shuffleDependency广播到executor
+//    获取taskBinary,将stage的RDD和shuffleDependency广播到executor
     // TODO: Maybe we can keep the taskBinary in Stage to avoid serializing it multiple times.
     // Broadcasted binary for the task, used to dispatch tasks to executors. Note that we broadcast
     // the serialized copy of the RDD and for each task we will deserialize it, which means each
@@ -1332,7 +1351,7 @@ class DAGScheduler(
         runningStages -= stage
         return
     }
-    //  为stage创建task
+//    为stage创建task
     val tasks: Seq[Task[_]] = try {
       stage match {
         case stage: ShuffleMapStage =>
