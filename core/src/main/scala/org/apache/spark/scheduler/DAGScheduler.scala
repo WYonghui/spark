@@ -1036,8 +1036,12 @@ class DAGScheduler(
       while (str != null) {
 //        阶段运行时间配置格式为“stageId duration”
         val profiles = str.split("\\W+")
-        stageDuration.put(stageIdToStage
-          .apply(Integer.parseInt(profiles(0))), Integer.parseInt(profiles(1)))
+        if (stageIdToStage.contains(Integer.parseInt(profiles(0)))) {
+          stageDuration.put(stageIdToStage
+            .apply(Integer.parseInt(profiles(0))), Integer.parseInt(profiles(1)))
+        }
+//        stageDuration.put(stageIdToStage
+//          .apply(Integer.parseInt(profiles(0))), Integer.parseInt(profiles(1)))
 
         str = bufferedReader.readLine()
       }
@@ -1066,24 +1070,23 @@ class DAGScheduler(
 
 //    存在配置信息，按执行时间计算influence
     if (hasProfile) {
-      logInfo("There is profile in hdfs")
       setPriorityWithStageDuration(stage, stageDuration, stagesPriority, stageToChildren)
-      logInfo("No.1: is here something wrong?")
     } else {
-      logInfo("There is not profile")
 //      实现按深度计算优先级
       setStagePriority(stage, stageToChildren, stagesPriority)
-      logInfo("No.2: is here something wrong?")
     }
 
 //      debug
     logInfo("Job id is " + stage.firstJobId)
     logInfo("stagesPriority's size is " + stagesPriority.keySet.size
-        + ", stageIdToStage's size is " + stageIdToStage.keySet.size)
+        + ", stageIdToStage's size is " + stageIdToStage.keySet.size
+        + ", stageToChildren's size is " + stageToChildren.size)
     logInfo("stageIdTostage: " + stageIdToStage.toString())
     logInfo("Stage id set: ")
     for (stageId <- stageIdToStage.keySet) {
-      logInfo(stageId + ", " + stagesPriority.apply(stageIdToStage(stageId)))
+      if (stagesPriority.contains(stageIdToStage(stageId))) {
+        logInfo(stageId + ", " + stagesPriority.apply(stageIdToStage(stageId)))
+      }
     }
 
 //  // job提交后的第一轮调度从优先级最高的开始,遍历并提交可提交的stage
